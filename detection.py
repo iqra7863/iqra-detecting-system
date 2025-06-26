@@ -1,67 +1,77 @@
-# local_detector.py
-
 import cv2
 import os
-from datetime import datetime
+import time
 from ultralytics import YOLO
+from datetime import datetime
+from helpers.logger import log_detection
+from helpers.pause_manager import is_paused
 
-# Load the YOLOv8 model
-model = YOLO('yolov8n.pt')  # You can replace with 'yolov8s.pt' or your trained model
+# Load the YOLOv8 model (use yolov8n.pt for Render memory limits)
+model = YOLO("yolov8n.pt")
 
-# Set your camera stream (IP or local)
-CAMERA_URL = 'http://100.94.103.96:8080/video'
-CAMERA_NAME = 'classroom_A'
+# Cooldown tracker dictionary
+cooldown_tracker = {}  # {camera_name: last_capture_time}
 
-# Setup folders
-screenshot_dir = 'screenshots'
-os.makedirs(screenshot_dir, exist_ok=True)
+# Cooldown duration in seconds (15s)
+COOLDOWN_TIME = 15
 
-log_file = 'detection_log.csv'
-if not os.path.exists(log_file):
-    with open(log_file, 'w') as f:
-        f.write('Timestamp,Camera\n')
+def generate_frames(camera_url, camera_name):
+    cap = cv2.VideoCapture(camera_url)
 
-# Start camera
-cap = cv2.VideoCapture(CAMERA_URL)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open camera: {camera_name}")
+        return
 
-if not cap.isOpened():
-    print(f"[ERROR] Cannot open camera: {CAMERA_URL}")
-    exit()
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
 
-print("[INFO] Camera stream started. Press 'q' to quit.")
+        # Pause detection if user requested
+        if is_paused():
+            continue
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("[ERROR] Failed to read frame.")
-        break
+        # Run detection
+        results = model.predict(frame, conf=0.5)
+        detected = False
 
-    # Run detection
-    results = model(frame)
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                cls = int(box.cls[0])
+                class_name = model.names[cls]
+                if class_name == 'cell phone':
+                    detected = True
+                    break
 
-    detected = False
-    for r in results:
-        for box in r.boxes:
-            class_id = int(box.cls)
-            cls_name = r.names[class_id]
-            if cls_name == 'cell phone':
-                detected = True
-                # Save screenshot
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                filename = f"{CAMERA_NAME}_{timestamp}.jpg"
-                cv2.imwrite(os.path.join(screenshot_dir, filename), frame)
+        # Screenshot saving with cooldown
+        if detected:
+            now = time.time()
+            last_capture = cooldown_tracker.get(camera_name, 0)
 
-                # Log detection
-                with open(log_file, 'a') as f:
-                    f.write(f"{timestamp},{CAMERA_NAME}\n")
+            if now - last_capture >= COOLDOWN_TIME:
+                save_screenshot(frame, camera_name)
+                cooldown_tracker[camera_name] = now
+                log_detection(camera_name)
+            else:
+                print(f"[{camera_name}] Cooldown active. Skipping screenshot.")
 
-                print(f"[DETECTED] Mobile phone at {timestamp}")
+        # Encode frame for web streaming
+        _, buffer = cv2.imencode('.jpg', frame)
+        frame_bytes = buffer.tobytes()
 
-    # (Optional) Show the frame in a window
-    cv2.imshow("Live Detection", results[0].plot())
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    cap.release()
 
-cap.release()
-cv2.destroyAllWindows()
+def save_screenshot(frame, camera_name):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{camera_name}_{timestamp}.jpg"
+    folder = os.path.join("static", "screenshots")
+
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
+
+    cv2.imwrite(path, frame)
+    print(f"[INFO] Saved screenshot: {path}")
